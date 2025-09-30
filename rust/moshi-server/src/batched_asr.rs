@@ -570,12 +570,21 @@ impl BatchedAsr {
         metrics::CONNECT.inc();
 
         let (mut sender, receiver) = socket.split();
+        let disable_msgpack = query.disable_msgpack;
+        let disable_step = query.disable_step;
         let (batch_idx, in_tx, mut out_rx) = match self.channels()? {
             Some(v) => v,
             None => {
                 tracing::error!("no free channels");
+                let err = OutMsg::Error { message: "no free channels".into() };
+                if disable_msgpack {
+                    let payload = serde_json::to_string(&err)?;
+                    sender.send(ws::Message::Text(payload.into())).await?;
+                    sender.close().await?;
+                    anyhow::bail!("no free channels")
+                }
                 let mut msg = vec![];
-                OutMsg::Error { message: "no free channels".into() }.serialize(
+                err.serialize(
                     &mut rmp_serde::Serializer::new(&mut msg)
                         .with_human_readable()
                         .with_struct_map(),
@@ -634,6 +643,20 @@ impl BatchedAsr {
                     Ok(None) => break,
                     Err(_) => ws::Message::Ping(vec![].into()),
                     Ok(Some(msg)) => {
+                        if disable_step && matches!(msg, OutMsg::Step { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::Ready) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::EndWord { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack {
+                            let payload = serde_json::to_string(&msg)?;
+                            sender.send(ws::Message::Text(payload.into())).await?;
+                            continue;
+                        }
                         let mut buf = vec![];
                         msg.serialize(
                             &mut rmp_serde::Serializer::new(&mut buf)

@@ -782,6 +782,10 @@ struct AsrStreamingQuery {
     auth_id: Option<String>,
     #[serde(default)]
     pcm16le: bool,
+    #[serde(default)]
+    disable_msgpack: bool,
+    #[serde(default)]
+    disable_step: bool,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -798,6 +802,10 @@ struct PyAsrStreamingQuery {
     auth_id: Option<String>,
     #[serde(default)]
     pcm16le: bool,
+    #[serde(default)]
+    disable_msgpack: bool,
+    #[serde(default)]
+    disable_step: bool,
 }
 
 fn asr_router(s: Arc<asr::Asr>, path: &str, ss: &SharedState) -> axum::Router<()> {

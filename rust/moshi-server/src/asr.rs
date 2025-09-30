@@ -152,6 +152,8 @@ impl Asr {
         let conditions = self.conditions.clone();
         let mut ogg_opus_decoder = kaudio::ogg_opus::Decoder::new(24000, 1920)?;
         let expect_pcm16le = query.pcm16le;
+        let disable_msgpack = query.disable_msgpack;
+        let disable_step = query.disable_step;
         let recv_loop = crate::utils::spawn("recv_loop", async move {
             let dev = state.device().clone();
             // Store the markers in a double ended queue
@@ -209,6 +211,9 @@ impl Asr {
                                 start_time,
                             },
                             moshi::asr::AsrMsg::Step { step_idx, prs } => {
+                                if disable_step {
+                                    continue;
+                                }
                                 let prs = prs.iter().map(|p| p[0]).collect::<Vec<_>>();
                                 OutMsg::Step { step_idx, prs, buffered_pcm: 0 }
                             }
@@ -236,18 +241,34 @@ impl Asr {
                 let msg = timeout(Duration::from_secs(10), rx.recv()).await;
                 let msg = match msg {
                     Ok(None) => break,
-                    Err(_) => ws::Message::Ping(vec![].into()),
+                    Err(_) => Some(ws::Message::Ping(vec![].into())),
                     Ok(Some(msg)) => {
+                        if disable_step && matches!(msg, OutMsg::Step { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::Ready) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::EndWord { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack {
+                            let payload = serde_json::to_string(&msg)?;
+                            sender.send(ws::Message::Text(payload.into())).await?;
+                            continue;
+                        }
                         let mut buf = vec![];
                         msg.serialize(
                             &mut rmp_serde::Serializer::new(&mut buf)
                                 .with_human_readable()
                                 .with_struct_map(),
                         )?;
-                        ws::Message::Binary(buf.into())
+                        Some(ws::Message::Binary(buf.into()))
                     }
                 };
-                sender.send(msg).await?;
+                if let Some(msg) = msg {
+                    sender.send(msg).await?;
+                }
             }
             tracing::info!("send loop exited");
             Ok::<(), anyhow::Error>(())

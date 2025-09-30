@@ -541,12 +541,21 @@ impl M {
         tracing::info!(?query, "py-asr handle-socket");
         metrics::CONNECT.inc();
         let (mut sender, receiver) = socket.split();
+        let disable_msgpack = query.disable_msgpack;
+        let disable_step = query.disable_step;
         let (bidx, in_tx, mut out_rx) = match self.channels()? {
             Some(x) => x,
             None => {
                 tracing::error!("no free channels");
+                let err = OutMsg::Error { message: "no free channels".into() };
+                if disable_msgpack {
+                    let payload = serde_json::to_string(&err)?;
+                    sender.send(ws::Message::Text(payload.into())).await?;
+                    sender.close().await?;
+                    anyhow::bail!("no free channels")
+                }
                 let mut msg = vec![];
-                OutMsg::Error { message: "no free channels".into() }.serialize(
+                err.serialize(
                     &mut rmp_serde::Serializer::new(&mut msg)
                         .with_human_readable()
                         .with_struct_map(),
@@ -602,18 +611,34 @@ impl M {
                 let msg = timeout(SEND_PING_EVERY, out_rx.recv()).await;
                 let msg = match msg {
                     Ok(None) => break,
-                    Err(_) => ws::Message::Ping(vec![].into()),
+                    Err(_) => Some(ws::Message::Ping(vec![].into())),
                     Ok(Some(msg)) => {
+                        if disable_step && matches!(msg, OutMsg::Step { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::Ready) {
+                            continue;
+                        }
+                        if disable_msgpack && matches!(msg, OutMsg::EndWord { .. }) {
+                            continue;
+                        }
+                        if disable_msgpack {
+                            let payload = serde_json::to_string(&msg)?;
+                            sender.send(ws::Message::Text(payload.into())).await?;
+                            continue;
+                        }
                         let mut buf = vec![];
                         msg.serialize(
                             &mut rmp_serde::Serializer::new(&mut buf)
                                 .with_human_readable()
                                 .with_struct_map(),
                         )?;
-                        ws::Message::Binary(buf.into())
+                        Some(ws::Message::Binary(buf.into()))
                     }
                 };
-                sender.send(msg).await?;
+                if let Some(msg) = msg {
+                    sender.send(msg).await?;
+                }
             }
             Ok::<(), anyhow::Error>(())
         });
