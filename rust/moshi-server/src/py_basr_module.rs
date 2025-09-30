@@ -5,6 +5,7 @@
 use crate::asr::{InMsg, OutMsg};
 use crate::metrics::asr as metrics;
 use crate::py_module::{init, toml_to_py, VerbosePyErr};
+use crate::transcript::{TrackerConfig, TranscriptTracker, TranscriptUpdate};
 use crate::PyAsrStreamingQuery as Query;
 use anyhow::{Context, Result};
 use axum::extract::ws;
@@ -117,9 +118,11 @@ impl Drop for Channel {
 }
 
 type Channels = Arc<Mutex<Vec<Option<Channel>>>>;
+type Transcripts = Arc<Mutex<Vec<TranscriptTracker>>>;
 
 struct Inner {
     channels: Channels,
+    transcripts: Transcripts,
     app: PyObject,
     text_tokenizer: Arc<sentencepiece::SentencePieceProcessor>,
     asr_delay_in_tokens: usize,
@@ -211,6 +214,58 @@ impl Inner {
         Ok((updates, channel_ids))
     }
 
+    fn handle_transcript_audio(
+        &self,
+        batch_pcm: &[f32],
+        updates: &[i32],
+        ref_channel_ids: &[Option<ChannelId>],
+    ) -> Result<()> {
+        if batch_pcm.is_empty() {
+            return Ok(());
+        }
+        let batch_channels = updates.len();
+        let mut updates_per_channel: Vec<(usize, Vec<TranscriptUpdate>)> = Vec::new();
+        {
+            let mut transcripts = self.transcripts.lock().unwrap();
+            for batch_idx in 0..batch_channels {
+                let tracker = match transcripts.get_mut(batch_idx) {
+                    Some(tracker) => tracker,
+                    None => continue,
+                };
+                match updates[batch_idx] {
+                    RESET => tracker.reset(),
+                    ACTIVE => {
+                        let start = batch_idx * FRAME_SIZE;
+                        let end = start + FRAME_SIZE;
+                        if end <= batch_pcm.len() {
+                            let slice = &batch_pcm[start..end];
+                            let pending = tracker.ingest_audio(slice);
+                            if !pending.is_empty() {
+                                updates_per_channel.push((batch_idx, pending));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if updates_per_channel.is_empty() {
+            return Ok(());
+        }
+        let mut channels = self.channels.lock().unwrap();
+        for (batch_idx, transcript_updates) in updates_per_channel {
+            if let Some(ch) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                for update in transcript_updates {
+                    if ch.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                        channels[batch_idx] = None;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn start_model_loop(self, batch_size: usize) -> Result<()> {
         use numpy::{PyArrayMethods, ToPyArray};
         use rayon::prelude::*;
@@ -247,6 +302,7 @@ impl Inner {
                         .context("pcm is not contiguous or not writable")?;
                     (updates, channel_ids) =
                         self.pre_process(step_idx, batch_size, batch_pcm, &mut markers)?;
+                    self.handle_transcript_audio(batch_pcm, &updates, &channel_ids)?;
                     self.app
                         .call_method1(
                             py,
@@ -362,25 +418,49 @@ impl Inner {
         markers: &mut BinaryHeap<Marker>,
         ref_channel_ids: &[Option<ChannelId>],
     ) -> Result<()> {
+        let mut transcripts = self.transcripts.lock().unwrap();
         let mut channels = self.channels.lock().unwrap();
         for asr_msg in asr_msgs.into_iter() {
             match asr_msg {
                 moshi::asr::AsrMsg::Word { tokens, start_time, batch_idx } => {
-                    let msg = OutMsg::Word {
-                        text: self.text_tokenizer.decode_piece_ids(&tokens)?,
-                        start_time,
-                    };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                    let text = self.text_tokenizer.decode_piece_ids(&tokens)?;
+                    if let Some(ch) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                        if ch
+                            .send(
+                                OutMsg::Word { text: text.clone(), start_time },
+                                ref_channel_ids[batch_idx],
+                            )
+                            .is_err()
+                        {
                             channels[batch_idx] = None;
+                            continue;
+                        }
+                        if let Some(update) = transcripts
+                            .get_mut(batch_idx)
+                            .and_then(|tracker| tracker.handle_word(&text, start_time))
+                        {
+                            if ch.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                                channels[batch_idx] = None;
+                            }
                         }
                     }
                 }
                 moshi::asr::AsrMsg::EndWord { stop_time, batch_idx } => {
-                    let msg = OutMsg::EndWord { stop_time };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                    if let Some(ch) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                        if ch
+                            .send(OutMsg::EndWord { stop_time }, ref_channel_ids[batch_idx])
+                            .is_err()
+                        {
                             channels[batch_idx] = None;
+                            continue;
+                        }
+                        if let Some(update) = transcripts
+                            .get_mut(batch_idx)
+                            .and_then(|tracker| tracker.handle_end_word(stop_time))
+                        {
+                            if ch.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                                channels[batch_idx] = None;
+                            }
                         }
                     }
                 }
@@ -397,6 +477,7 @@ impl Inner {
                 }
             }
         }
+        drop(transcripts);
         while let Some(m) = markers.peek() {
             if m.step_idx <= step_idx {
                 if let Some(c) = channels[m.batch_idx].as_ref() {
@@ -459,9 +540,14 @@ impl M {
                 .with_context(|| config.text_tokenizer_file.clone())?;
         let channels = (0..batch_size).map(|_| None).collect::<Vec<_>>();
         let channels = Arc::new(Mutex::new(channels));
+        let transcripts = (0..batch_size)
+            .map(|_| TranscriptTracker::new(TrackerConfig::default()))
+            .collect::<Vec<_>>();
+        let transcripts = Arc::new(Mutex::new(transcripts));
         let inner = Inner {
             app,
             channels: channels.clone(),
+            transcripts,
             text_tokenizer: text_tokenizer.into(),
             asr_delay_in_tokens,
         };
@@ -526,9 +612,10 @@ impl M {
         while let Some(msg) = out_rx.recv().await {
             match msg {
                 OutMsg::Marker { .. } => break,
-                OutMsg::Error { .. } | OutMsg::Word { .. } | OutMsg::EndWord { .. } => {
-                    msgs.push(msg)
-                }
+                OutMsg::Error { .. }
+                | OutMsg::Word { .. }
+                | OutMsg::EndWord { .. }
+                | OutMsg::Transcript { .. } => msgs.push(msg),
                 OutMsg::Ready | OutMsg::Step { .. } => {}
             }
         }

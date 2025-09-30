@@ -21,9 +21,11 @@ mod protocol;
 mod py_basr_module;
 mod py_module;
 mod py_module_post;
+mod transcript;
 mod tts;
 mod tts_preprocess;
 mod utils;
+mod vad;
 
 const ID_HEADER: &str = "kyutai-api-key";
 const ROOM_ID_HEADER: &str = "room_id";

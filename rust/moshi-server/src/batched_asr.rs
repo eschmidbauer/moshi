@@ -4,6 +4,7 @@
 
 use crate::asr::{InMsg, OutMsg};
 use crate::metrics::asr as metrics;
+use crate::transcript::{TrackerConfig, TranscriptTracker, TranscriptUpdate};
 use crate::AsrStreamingQuery as Query;
 use anyhow::{Context, Result};
 use axum::extract::ws;
@@ -44,6 +45,7 @@ type InSend = std::sync::mpsc::Sender<InMsg>;
 type InRecv = std::sync::mpsc::Receiver<InMsg>;
 type OutSend = tokio::sync::mpsc::UnboundedSender<OutMsg>;
 type OutRecv = tokio::sync::mpsc::UnboundedReceiver<OutMsg>;
+type Transcripts = Arc<Mutex<Vec<TranscriptTracker>>>;
 
 /// Unique identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -162,6 +164,7 @@ impl Logger {
 
 struct BatchedAsrInner {
     channels: Channels,
+    transcripts: Transcripts,
     asr_delay_in_tokens: usize,
     temperature: f64,
     lm: moshi::lm::LmModel,
@@ -235,6 +238,7 @@ impl BatchedAsrInner {
                     self.pre_process(&mut state, step_idx, &mut markers);
                 let with_data = mask.iter().filter(|v| **v).count();
                 if with_data > 0 {
+                    self.handle_vad_updates(&batch_pcm, &mask, &ref_channel_ids)?;
                     let mask = moshi::StreamMask::new(mask, &dev)?;
                     let pcm =
                         Tensor::new(batch_pcm.as_slice(), &dev)?.reshape((batch_size, 1, ()))?;
@@ -289,88 +293,150 @@ impl BatchedAsrInner {
         }
 
         let mut mask = vec![false; state.batch_size()];
-        let mut channels = self.channels.lock().unwrap();
-        let mut batch_pcm = vec![0f32; FRAME_SIZE * channels.len()];
-        let channel_ids = channels.iter().map(|c| c.as_ref().map(|c| c.id)).collect::<Vec<_>>();
-        let todo = batch_pcm
-            .par_chunks_mut(FRAME_SIZE)
-            .zip(channels.par_iter_mut())
-            .zip(mask.par_iter_mut())
-            .enumerate()
-            .flat_map(|(bid, ((out_pcm, channel), mask))| -> Option<Todo> {
-                let c = channel.as_mut()?;
-                if c.out_tx.is_closed() {
-                    *channel = None;
-                    None
-                } else {
-                    use std::sync::mpsc::TryRecvError;
-                    match c.in_rx.try_recv() {
-                        Ok(InMsg::Init) => {
-                            if c.out_tx.send(OutMsg::Ready).is_err() {
-                                *channel = None;
+        let (batch_pcm, channel_ids, todo) = {
+            let mut channels = self.channels.lock().unwrap();
+            let mut batch_pcm = vec![0f32; FRAME_SIZE * channels.len()];
+            let channel_ids = channels.iter().map(|c| c.as_ref().map(|c| c.id)).collect::<Vec<_>>();
+            let todo = batch_pcm
+                .par_chunks_mut(FRAME_SIZE)
+                .zip(channels.par_iter_mut())
+                .zip(mask.par_iter_mut())
+                .enumerate()
+                .flat_map(|(bid, ((out_pcm, channel), mask))| -> Option<Todo> {
+                    let c = channel.as_mut()?;
+                    if c.out_tx.is_closed() {
+                        *channel = None;
+                        None
+                    } else {
+                        use std::sync::mpsc::TryRecvError;
+                        match c.in_rx.try_recv() {
+                            Ok(InMsg::Init) => {
+                                if c.out_tx.send(OutMsg::Ready).is_err() {
+                                    *channel = None;
+                                }
+                                Some(Todo::Reset(bid))
                             }
-                            Some(Todo::Reset(bid))
-                        }
-                        Ok(InMsg::Marker { id }) => {
-                            tracing::info!(bid, id, "received marker");
-                            // The marker only gets sent back once all the current data has been
-                            // processed and the asr delay has passed.
-                            let current_data = c.data.len() / FRAME_SIZE;
-                            let step_idx = step_idx + state.asr_delay_in_tokens() + current_data;
-                            let marker = Marker {
-                                channel_id: c.id,
-                                batch_idx: bid,
-                                step_idx,
-                                marker_id: id,
-                            };
-                            Some(Todo::Marker(marker))
-                        }
-                        Ok(InMsg::OggOpus { data }) => {
-                            match c.decoder.decode(&data) {
-                                Err(err) => tracing::error!(?err, "oggopus not supported"),
-                                Ok(None) => {}
-                                Ok(Some(pcm)) => {
-                                    out_pcm.copy_from_slice(pcm);
+                            Ok(InMsg::Marker { id }) => {
+                                tracing::info!(bid, id, "received marker");
+                                // The marker only gets sent back once all the current data has been
+                                // processed and the asr delay has passed.
+                                let current_data = c.data.len() / FRAME_SIZE;
+                                let step_idx =
+                                    step_idx + state.asr_delay_in_tokens() + current_data;
+                                let marker = Marker {
+                                    channel_id: c.id,
+                                    batch_idx: bid,
+                                    step_idx,
+                                    marker_id: id,
+                                };
+                                Some(Todo::Marker(marker))
+                            }
+                            Ok(InMsg::OggOpus { data }) => {
+                                match c.decoder.decode(&data) {
+                                    Err(err) => tracing::error!(?err, "oggopus not supported"),
+                                    Ok(None) => {}
+                                    Ok(Some(pcm)) => {
+                                        out_pcm.copy_from_slice(pcm);
+                                        c.steps += 1;
+                                        *mask = true;
+                                    }
+                                }
+                                None
+                            }
+                            Ok(InMsg::Audio { pcm }) => {
+                                if let Some(bpcm) = c.extend_data(pcm) {
+                                    out_pcm.copy_from_slice(&bpcm);
                                     c.steps += 1;
                                     *mask = true;
                                 }
+                                None
                             }
-                            None
-                        }
-                        Ok(InMsg::Audio { pcm }) => {
-                            if let Some(bpcm) = c.extend_data(pcm) {
-                                out_pcm.copy_from_slice(&bpcm);
-                                c.steps += 1;
-                                *mask = true;
+                            Err(TryRecvError::Empty) => {
+                                // Even if we haven't received new data, we process the existing one.
+                                if let Some(bpcm) = c.extend_data(vec![]) {
+                                    out_pcm.copy_from_slice(&bpcm);
+                                    c.steps += 1;
+                                    *mask = true;
+                                }
+                                None
                             }
-                            None
-                        }
-                        Err(TryRecvError::Empty) => {
-                            // Even if we haven't received new data, we process the existing one.
-                            if let Some(bpcm) = c.extend_data(vec![]) {
-                                out_pcm.copy_from_slice(&bpcm);
-                                c.steps += 1;
-                                *mask = true;
+                            Err(TryRecvError::Disconnected) => {
+                                *channel = None;
+                                None
                             }
-                            None
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            *channel = None;
-                            None
                         }
                     }
+                })
+                .collect::<Vec<_>>();
+            (batch_pcm, channel_ids, todo)
+        };
+        let mut reset_indices = vec![];
+        for t in todo.into_iter() {
+            match t {
+                Todo::Reset(bid) => {
+                    if let Err(err) = state.reset_batch_idx(bid) {
+                        tracing::error!(?err, bid, "failed to reset batch");
+                    }
+                    reset_indices.push(bid);
                 }
-            })
-            .collect::<Vec<_>>();
-        todo.into_iter().for_each(|t| match t {
-            Todo::Reset(bid) => {
-                if let Err(err) = state.reset_batch_idx(bid) {
-                    tracing::error!(?err, bid, "failed to reset batch");
+                Todo::Marker(m) => markers.push(m),
+            }
+        }
+        if !reset_indices.is_empty() {
+            if let Ok(mut transcripts) = self.transcripts.lock() {
+                for bid in reset_indices {
+                    if let Some(tracker) = transcripts.get_mut(bid) {
+                        tracker.reset();
+                    }
                 }
             }
-            Todo::Marker(m) => markers.push(m),
-        });
+        }
         (batch_pcm, mask, channel_ids)
+    }
+
+    fn handle_vad_updates(
+        &self,
+        batch_pcm: &[f32],
+        mask: &[bool],
+        ref_channel_ids: &[Option<ChannelId>],
+    ) -> Result<()> {
+        if batch_pcm.is_empty() {
+            return Ok(());
+        }
+        let mut updates_per_channel: Vec<(usize, Vec<TranscriptUpdate>)> = Vec::new();
+        {
+            let mut transcripts = self.transcripts.lock().unwrap();
+            for (batch_idx, tracker) in transcripts.iter_mut().enumerate() {
+                if !mask.get(batch_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let start = batch_idx * FRAME_SIZE;
+                let end = start + FRAME_SIZE;
+                if end > batch_pcm.len() {
+                    continue;
+                }
+                let slice = &batch_pcm[start..end];
+                let updates = tracker.ingest_audio(slice);
+                if !updates.is_empty() {
+                    updates_per_channel.push((batch_idx, updates));
+                }
+            }
+        }
+        if updates_per_channel.is_empty() {
+            return Ok(());
+        }
+        let mut channels = self.channels.lock().unwrap();
+        for (batch_idx, updates) in updates_per_channel {
+            if let Some(c) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                for update in updates {
+                    if c.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                        channels[batch_idx] = None;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn post_process(
@@ -381,24 +447,48 @@ impl BatchedAsrInner {
         mask: &moshi::StreamMask,
         ref_channel_ids: &[Option<ChannelId>],
     ) -> Result<()> {
+        let mut transcripts = self.transcripts.lock().unwrap();
         let mut channels = self.channels.lock().unwrap();
         for asr_msg in asr_msgs.into_iter() {
             match asr_msg {
                 moshi::asr::AsrMsg::Word { tokens, start_time, batch_idx } => {
                     let text = self.text_tokenizer.decode_piece_ids(&tokens)?;
                     tracing::info!(batch_idx, start_time, text = %text, "asr word");
-                    let msg = OutMsg::Word { text, start_time };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                    if let Some(c) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                        if c.send(
+                            OutMsg::Word { text: text.clone(), start_time },
+                            ref_channel_ids[batch_idx],
+                        )
+                        .is_err()
+                        {
                             channels[batch_idx] = None;
+                            continue;
+                        }
+                        if let Some(update) = transcripts
+                            .get_mut(batch_idx)
+                            .and_then(|tracker| tracker.handle_word(&text, start_time))
+                        {
+                            if c.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                                channels[batch_idx] = None;
+                            }
                         }
                     }
                 }
                 moshi::asr::AsrMsg::EndWord { stop_time, batch_idx } => {
-                    let msg = OutMsg::EndWord { stop_time };
-                    if let Some(c) = channels[batch_idx].as_ref() {
-                        if c.send(msg, ref_channel_ids[batch_idx]).is_err() {
+                    if let Some(c) = channels.get_mut(batch_idx).and_then(|c| c.as_mut()) {
+                        if c.send(OutMsg::EndWord { stop_time }, ref_channel_ids[batch_idx])
+                            .is_err()
+                        {
                             channels[batch_idx] = None;
+                            continue;
+                        }
+                        if let Some(update) = transcripts
+                            .get_mut(batch_idx)
+                            .and_then(|tracker| tracker.handle_end_word(stop_time))
+                        {
+                            if c.send(update.into(), ref_channel_ids[batch_idx]).is_err() {
+                                channels[batch_idx] = None;
+                            }
                         }
                     }
                 }
@@ -418,6 +508,7 @@ impl BatchedAsrInner {
                 }
             }
         }
+        drop(transcripts);
         while let Some(m) = markers.peek() {
             if m.step_idx <= step_idx {
                 if let Some(c) = channels[m.batch_idx].as_ref() {
@@ -438,6 +529,7 @@ type Channels = Arc<Mutex<Vec<Option<Channel>>>>;
 
 pub struct BatchedAsr {
     channels: Channels,
+    transcripts: Transcripts,
     config: crate::AsrConfig,
     batch_size: usize,
 }
@@ -474,6 +566,10 @@ impl BatchedAsr {
             .with_context(|| asr.text_tokenizer_file.clone())?;
         let channels = (0..batch_size).map(|_| None).collect::<Vec<_>>();
         let channels = Arc::new(Mutex::new(channels));
+        let transcripts = (0..batch_size)
+            .map(|_| TranscriptTracker::new(TrackerConfig::default()))
+            .collect::<Vec<_>>();
+        let transcripts = Arc::new(Mutex::new(transcripts));
         let asr_delay_in_tokens =
             asr.conditioning_delay.map_or(asr.asr_delay_in_tokens, |v| (v * 12.5) as usize + 1);
         let batched_asr = BatchedAsrInner {
@@ -483,6 +579,7 @@ impl BatchedAsr {
             audio_tokenizer,
             text_tokenizer: text_tokenizer.into(),
             channels: channels.clone(),
+            transcripts: transcripts.clone(),
         };
         let logger = match asr.log_frequency_s {
             Some(s) => Some(Logger::new(&config.instance_name, &config.log_dir, s)?),
@@ -497,23 +594,36 @@ impl BatchedAsr {
         if let Some(logger) = logger {
             logger.log_loop()
         }
-        Ok(Self { channels, config: asr.clone(), batch_size })
+        Ok(Self { channels, transcripts, config: asr.clone(), batch_size })
     }
 
     fn channels(&self) -> Result<Option<(usize, InSend, OutRecv)>> {
-        let mut channels = self.channels.lock().unwrap();
-        // Linear scan to find an available channel. This is fairly inefficient, instead we should
-        // probably have a queue of available slots.
-        for (batch_idx, channel) in channels.iter_mut().enumerate() {
-            if channel.is_none() {
-                let (in_tx, in_rx) = std::sync::mpsc::channel::<InMsg>();
-                let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<OutMsg>();
-                let c = Channel::new(in_rx, out_tx)?;
-                *channel = Some(c);
-                return Ok(Some((batch_idx, in_tx, out_rx)));
+        let mut result = None;
+        let mut reset_idx = None;
+        {
+            let mut channels = self.channels.lock().unwrap();
+            // Linear scan to find an available channel. This is fairly inefficient; instead we
+            // could track a queue of available slots.
+            for (batch_idx, channel) in channels.iter_mut().enumerate() {
+                if channel.is_none() {
+                    let (in_tx, in_rx) = std::sync::mpsc::channel::<InMsg>();
+                    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<OutMsg>();
+                    let c = Channel::new(in_rx, out_tx)?;
+                    *channel = Some(c);
+                    result = Some((batch_idx, in_tx, out_rx));
+                    reset_idx = Some(batch_idx);
+                    break;
+                }
             }
         }
-        Ok(None)
+        if let Some(idx) = reset_idx {
+            if let Ok(mut transcripts) = self.transcripts.lock() {
+                if let Some(tracker) = transcripts.get_mut(idx) {
+                    tracker.reset();
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub async fn handle_query(&self, query: axum::body::Bytes) -> Result<Vec<OutMsg>> {
@@ -553,9 +663,10 @@ impl BatchedAsr {
         while let Some(msg) = out_rx.recv().await {
             match msg {
                 OutMsg::Marker { .. } => break,
-                OutMsg::Error { .. } | OutMsg::Word { .. } | OutMsg::EndWord { .. } => {
-                    msgs.push(msg)
-                }
+                OutMsg::Error { .. }
+                | OutMsg::Word { .. }
+                | OutMsg::EndWord { .. }
+                | OutMsg::Transcript { .. } => msgs.push(msg),
                 OutMsg::Ready | OutMsg::Step { .. } => {}
             }
         }

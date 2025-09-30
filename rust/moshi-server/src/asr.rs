@@ -2,6 +2,7 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
+use crate::transcript::{TrackerConfig, TranscriptTracker, TranscriptUpdate};
 use crate::AsrStreamingQuery as Query;
 use anyhow::{bail, Context, Result};
 use axum::extract::ws;
@@ -48,10 +49,22 @@ impl InMsg {
 pub enum OutMsg {
     Word { text: String, start_time: f64 },
     EndWord { stop_time: f64 },
+    Transcript { text: String, start_time: f64, stop_time: Option<f64>, is_final: bool },
     Marker { id: i64 },
     Step { step_idx: usize, prs: Vec<f32>, buffered_pcm: usize },
     Error { message: String },
     Ready,
+}
+
+impl From<TranscriptUpdate> for OutMsg {
+    fn from(update: TranscriptUpdate) -> Self {
+        Self::Transcript {
+            text: update.text,
+            start_time: update.start_time,
+            stop_time: update.stop_time,
+            is_final: update.is_final,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -158,6 +171,7 @@ impl Asr {
             let dev = state.device().clone();
             // Store the markers in a double ended queue
             let mut markers = VecDeque::new();
+            let mut transcript = TranscriptTracker::new(TrackerConfig::default());
             while let Some(msg) = receiver.next().await {
                 let msg = match msg? {
                     ws::Message::Binary(x) => x,
@@ -181,6 +195,9 @@ impl Asr {
                 };
                 if let Some(pcm) = pcm {
                     tracing::info!("received audio {}", pcm.len());
+                    for update in transcript.ingest_audio(&pcm) {
+                        tx.send(update.into())?;
+                    }
                     let pcm = Tensor::new(pcm.as_slice(), &dev)?
                         .reshape((1, 1, ()))?
                         .broadcast_as((state.batch_size(), 1, pcm.len()))?;
@@ -205,23 +222,28 @@ impl Asr {
                         },
                     )?;
                     for asr_msg in asr_msgs.into_iter() {
-                        let msg = match asr_msg {
-                            moshi::asr::AsrMsg::Word { tokens, start_time, .. } => OutMsg::Word {
-                                text: text_tokenizer.decode_piece_ids(&tokens)?,
-                                start_time,
-                            },
+                        match asr_msg {
+                            moshi::asr::AsrMsg::Word { tokens, start_time, .. } => {
+                                let text = text_tokenizer.decode_piece_ids(&tokens)?;
+                                tx.send(OutMsg::Word { text: text.clone(), start_time })?;
+                                if let Some(update) = transcript.handle_word(&text, start_time) {
+                                    tx.send(update.into())?;
+                                }
+                            }
                             moshi::asr::AsrMsg::Step { step_idx, prs } => {
                                 if disable_step {
                                     continue;
                                 }
                                 let prs = prs.iter().map(|p| p[0]).collect::<Vec<_>>();
-                                OutMsg::Step { step_idx, prs, buffered_pcm: 0 }
+                                tx.send(OutMsg::Step { step_idx, prs, buffered_pcm: 0 })?;
                             }
                             moshi::asr::AsrMsg::EndWord { stop_time, .. } => {
-                                OutMsg::EndWord { stop_time }
+                                tx.send(OutMsg::EndWord { stop_time })?;
+                                if let Some(update) = transcript.handle_end_word(stop_time) {
+                                    tx.send(update.into())?;
+                                }
                             }
-                        };
-                        tx.send(msg)?
+                        }
                     }
                     while let Some((step_idx, id)) = markers.front() {
                         if *step_idx + asr_delay_in_tokens <= state.model_step_idx() {
@@ -232,6 +254,9 @@ impl Asr {
                         }
                     }
                 }
+            }
+            if let Some(update) = transcript.force_finalize() {
+                let _ = tx.send(update.into());
             }
             Ok::<(), anyhow::Error>(())
         });
